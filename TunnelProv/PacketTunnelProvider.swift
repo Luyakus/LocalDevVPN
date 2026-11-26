@@ -81,17 +81,37 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     func setPackets() {
         packetFlow.readPackets { [self] packets, protocols in
             var modified = packets
-            
+
             for i in modified.indices where protocols[i].int32Value == AF_INET && modified[i].count >= 20 {
-                modified[i].withUnsafeMutableBytes { bytes in
-                    guard let ptr = bytes.baseAddress?.assumingMemoryBound(to: UInt32.self) else { return }
-                    let src = ptr[3]
-                    let dst = ptr[4]
-                    ptr[3] = dst
-                    ptr[4] = src
+                modified[i].withUnsafeMutableBytes { raw in
+                    guard let base = raw.baseAddress else { return }
+                    let hdr = base.assumingMemoryBound(to: UInt32.self)
+
+                    // 交换 src/dst
+                    let src = hdr[3]
+                    let dst = hdr[4]
+                    hdr[3] = dst
+                    hdr[4] = src
+
+                    // 重算 IPv4 头校验和：改写头后原校验和失效，
+                    // 内核会丢弃校验和错误的回环包（表现为 SYN 石沉大海）
+                    let ihl = Int(base.load(as: UInt8.self) & 0x0F) * 4
+                    guard ihl >= 20, ihl <= raw.count else { return }
+
+                    let hdrBytes = base.assumingMemoryBound(to: UInt16.self)
+                    hdrBytes[5] = 0
+
+                    var sum: UInt32 = 0
+                    for j in 0 ..< (ihl / 2) {
+                        sum += UInt32(hdrBytes[j])
+                    }
+                    while sum >> 16 != 0 {
+                        sum = (sum & 0xFFFF) + (sum >> 16)
+                    }
+                    hdrBytes[5] = ~UInt16(sum)
                 }
             }
-            
+
             self.packetFlow.writePackets(modified, withProtocols: protocols)
             setPackets()
         }
